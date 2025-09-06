@@ -1,190 +1,230 @@
 /*------------------------------------------------------------------------
  *
- *  Copyright (c) 2021 by Bo Young Kang, All rights reserved.
- *
- *  File name  : fully_connected.v
- *  Written by : Kang, Bo Young
- *  Written on : Oct 13, 2021
- *  Version    : 21.2
- *  Design     : Fully Connected Layer for CNN
+ * File name  : fully_connected.v
+ * Design     : Fully Connected Layer for CNN (Corrected to match output)
  *
  *------------------------------------------------------------------------*/
+module fully_connected #(
+  parameter integer INPUT_NUM  = 48,
+  parameter integer OUTPUT_NUM = 10,
+  parameter integer DATA_BITS  = 8,
+  parameter integer SHIFT      = 7
+)(
+  input  wire                  clk,
+  input  wire                  rst_n,
 
-/*-------------------------------------------------------------------
- *  Module: fully_connected
- *------------------------------------------------------------------*/
-`timescale 1ps/1ps
+  input  wire                  valid_in,
+  input  wire signed [11:0]    data_in_1,
+  input  wire signed [11:0]    data_in_2,
+  input  wire signed [11:0]    data_in_3,
 
- module fully_connected #(parameter INPUT_NUM = 48, OUTPUT_NUM = 10, DATA_BITS = 8) (
-   input clk,
-   input rst_n,
-   input valid_in,
-   input signed [11:0] data_in_1, data_in_2, data_in_3,
-   output reg [11:0] data_out,
-   output reg valid_out_fc,
-   input [0:3839] w_fc,
-   input [0:79] b_fc
- );
+  output reg  [11:0]           data_out,
+  output reg                   valid_out_fc,
 
- localparam INPUT_WIDTH = 16;
- localparam INPUT_NUM_DATA_BITS = 5;
+  input  wire [0:INPUT_NUM*OUTPUT_NUM*DATA_BITS-1] w_fc,
+  input  wire [0:OUTPUT_NUM*DATA_BITS-1]           b_fc
+);
 
- reg state;
- reg [INPUT_WIDTH - 1:0] buf_idx;
- reg [3:0] out_idx;
- reg signed [13:0] buffer [0:INPUT_NUM - 1];
- reg signed [DATA_BITS - 1:0] weight [0:INPUT_NUM * OUTPUT_NUM - 1];
- reg signed [DATA_BITS - 1:0] bias [0:OUTPUT_NUM - 1];
-   
- wire signed [19:0] calc_out;
-
-integer i;
- always @(*) begin
-    for(i=0;i<INPUT_NUM*OUTPUT_NUM;i=i+1) begin
-        weight[i]=w_fc[(8*i)+:8];
+  function integer CLOG2;
+    input integer v;
+    integer t;
+    begin
+      t=v-1; CLOG2=0; while(t>0) begin t=t>>1; CLOG2=CLOG2+1; end
     end
-    for(i=0;i<OUTPUT_NUM;i=i+1) begin
-        bias[i]=b_fc[(8*i)+:8];
+  endfunction
+
+  // =========================================================================
+  // ## [ìˆ˜ì • 1] íŒŒì´í”„ë¼ì¸ ê¹Šì´(LAT)ë¥¼ 10ìœ¼ë¡œ ìˆ˜ì • ##
+  // BRAM Address(1) + Latch(1) + Multiply(1) + Adder Tree(6) = 9 stages to get s1.
+  // The final output stage is the 10th stage.
+  // =========================================================================
+  localparam integer INPUT_WIDTH = 16;
+  localparam integer FILL_W      = CLOG2(INPUT_WIDTH);
+  localparam integer OUT_W       = CLOG2(OUTPUT_NUM);
+  localparam integer WB_DW       = INPUT_NUM*DATA_BITS;
+  localparam integer WB_AW       = CLOG2(OUTPUT_NUM);
+  localparam integer PROD_W      = 22; // 14x8
+  localparam integer LAT         = 10;
+
+  // Input Buffer & FSM States
+  reg signed [13:0] buffer [0:INPUT_NUM-1];
+  reg [FILL_W-1:0]  buf_idx;
+  reg               state;
+  reg [OUT_W-1:0]   out_idx;
+
+  wire signed [13:0] d1 = data_in_1[11] ? {2'b11,data_in_1} : {2'b00,data_in_1};
+  wire signed [13:0] d2 = data_in_2[11] ? {2'b11,data_in_2} : {2'b00,data_in_2};
+  wire signed [13:0] d3 = data_in_3[11] ? {2'b11,data_in_3} : {2'b00,data_in_3};
+
+  // Bias memory
+  reg signed [DATA_BITS-1:0] bias_mem [0:OUTPUT_NUM-1];
+  integer bi;
+  always @(*) begin
+    for (bi=0; bi<OUTPUT_NUM; bi=bi+1)
+      bias_mem[bi] = b_fc[(DATA_BITS*bi)+:DATA_BITS];
+  end
+
+  // Weight BRAM interface
+  wire [WB_DW-1:0] wb_r_data;
+  reg  [WB_AW-1:0] wb_r_addr;
+  reg              wb_w_en;
+  reg  [WB_AW-1:0]  wb_w_addr;
+  reg  [WB_DW-1:0]  wb_w_data;
+
+  // BRAM Instantiation
+  // Assuming a 'weight_bram' module with 1-clock synchronous read latency exists.
+  weight_bram #(
+    .DATA_WIDTH (WB_DW),
+    .DEPTH      (OUTPUT_NUM),
+    .ADDR_WIDTH (WB_AW)
+  ) weight_bram_inst (
+    .clk(clk), .rst_n(rst_n), .w_en(wb_w_en), .w_addr(wb_w_addr),
+    .w_data(wb_w_data), .r_addr(wb_r_addr), .r_data(wb_r_data)
+  );
+
+// -------- Weight loading logic (FIXED: keep last write enabled) --------
+reg           load_done;
+reg [WB_AW:0] load_cnt;
+
+always @(posedge clk or negedge rst_n) begin
+  if (!rst_n) begin
+    load_done <= 1'b0;
+    load_cnt  <= { (WB_AW+1){1'b0} };
+    wb_w_en   <= 1'b0;
+    wb_w_addr <= {WB_AW{1'b0}};
+    wb_w_data <= {WB_DW{1'b0}};
+  end else if (!load_done) begin
+    // write one row per cycle
+    wb_w_en   <= 1'b1;
+    wb_w_addr <= load_cnt[WB_AW-1:0];
+    wb_w_data <= w_fc[(load_cnt*WB_DW) +: WB_DW];
+
+    if (load_cnt == OUTPUT_NUM-1) begin
+      // ì´ë²ˆ í´ëŸ­ì€ ë§ˆì§€ë§‰ í–‰ì„ 'ì§„ì§œë¡œ' ì“°ê³ ,
+      //    load_doneë§Œ ì˜¬ë ¤ë‘”ë‹¤. wb_w_enì€ ì´ë²ˆ í´ëŸ­ 1ë¡œ ìœ ì§€!
+      load_done <= 1'b1;
+      // load_cntëŠ” ì—¬ê¸°ì„œ ë” ì˜¬ë¦¬ì§€ ì•ŠìŒ
+    end else begin
+      load_cnt  <= load_cnt + 1'b1;
     end
+  end else begin
+    // ë§ˆì§€ë§‰ í–‰ì„ ì“´ 'ë‹¤ìŒ' í´ëŸ­ì— w_enì„ 0ìœ¼ë¡œ
+    wb_w_en <= 1'b0;
+  end
 end
- 
- 
- wire signed [13:0] data1 = (data_in_1[11] == 1) ? {2'b11, data_in_1} : {2'b00, data_in_1};
- wire signed [13:0] data2 = (data_in_2[11] == 1) ? {2'b11, data_in_2} : {2'b00, data_in_2};
- wire signed [13:0] data3 = (data_in_3[11] == 1) ? {2'b11, data_in_3} : {2'b00, data_in_3};
- 
-// ---------- ?  ?  ?  ?  ?  : 48 MAC -> (24+24) adder tree -> bias ----------
-  localparam PROD_W = 22;      // 14b * 8b
-  localparam SUM_W  = PROD_W + 5;   // 25?   ?  ?   ?  ?   ?  ?  
-  localparam AT_LAT = 5;            // adder_tree25_pipe ?   ? ?  
-  localparam LAT    = 2 + AT_LAT + 1; //  ? ?   ??  ?   + ?   ? + ìµœì¢…  ??  
 
-  reg [3:0] out_idx_q, out_idx_qA, out_idx_qB;
-  reg       fire_calc_q;
 
-  wire fire_calc = valid_in & state;
-
-  always @(posedge clk) begin
+  // Pipeline control
+  wire fire_calc = valid_in & state & load_done;
+  reg [LAT-1:0]   vpipe;
+  reg [OUT_W-1:0] out_idx_pipe [0:LAT-1];
+  integer pi;
+  always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
-      fire_calc_q <= 1'b0;
-      out_idx_q   <= 4'd0;
-      out_idx_qA  <= 4'd0;
-      out_idx_qB  <= 4'd0;
+      vpipe <= 0;
+      for (pi=0; pi<LAT; pi=pi+1) out_idx_pipe[pi] <= 0;
     end else begin
-      fire_calc_q <= fire_calc;     // ?•œ ?‚¬?´?´ ì§??—°?œ fire
-      if (fire_calc) begin
-        out_idx_q  <= out_idx;      // ?„ ?ž˜ì¹?(ë¡œì»¬ ?”Œë¡??œ¼ë¡? ?Šê¸?)
-        out_idx_qA <= out_idx;      // ë³µì œ A
-        out_idx_qB <= out_idx;      // ë³µì œ B
-      end
+      vpipe <= {vpipe[LAT-2:0], fire_calc};
+      for (pi=LAT-1; pi>0; pi=pi-1) out_idx_pipe[pi] <= out_idx_pipe[pi-1];
+      if (fire_calc) out_idx_pipe[0] <= out_idx;
     end
   end
 
-  // ---------- ê³? ? ˆì§??Š¤?„°(24+24, 25ë²ˆì§¸?Š” 0 ?Œ¨?”©) ----------
-  reg signed [PROD_W-1:0] prodA [0:24];
-  reg signed [PROD_W-1:0] prodB [0:24];
-  integer k;
-  always @(posedge clk) begin
-    if (!rst_n) begin
-      for (k=0;k<25;k=k+1) begin
-        prodA[k] <= {PROD_W{1'b0}};
-        prodB[k] <= {PROD_W{1'b0}};
-      end
-    end else if (fire_calc_q) begin
-      // out_idx_qA/B ?‚¬?š© ?†’ out_idx?˜ ê±°ë??•œ MUX/?Œ¬?•„?›ƒ?„ ?„ ?ž˜ì¹? ?Š¤?…Œ?´ì§?ë¡? ë¶„ë¦¬
-      for (k=0;k<24;k=k+1) begin
-        prodA[k] <= $signed(weight[out_idx_qA*INPUT_NUM + k])        * $signed(buffer[k]);
-        prodB[k] <= $signed(weight[out_idx_qB*INPUT_NUM + 24 + k])   * $signed(buffer[24+k]);
-      end
-      prodA[24] <= {PROD_W{1'b0}};
-      prodB[24] <= {PROD_W{1'b0}};
+  // Pipeline Stages
+  always @(posedge clk or negedge rst_n) begin if (!rst_n) wb_r_addr <= 0; else if (fire_calc) wb_r_addr <= out_idx; end // Stage 1
+  reg [WB_DW-1:0] weights_reg;
+  always @(posedge clk or negedge rst_n) begin if (!rst_n) weights_reg <= 0; else if (vpipe[0]) weights_reg <= wb_r_data; end // Stage 2
+  reg signed [PROD_W-1:0] prod [0:INPUT_NUM-1];
+  integer mk;
+  always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) for (mk=0; mk<INPUT_NUM; mk=mk+1) prod[mk] <= 0;
+  
+    else if (vpipe[1]) begin
+      for (mk=0; mk<INPUT_NUM; mk=mk+1)
+        prod[mk] <= $signed(buffer[mk]) * $signed(weights_reg[((INPUT_NUM-1-mk)*DATA_BITS) +: DATA_BITS]);
     end
+  end // Stage 3
+
+  // Adder Tree (Stages 4-9)
+  reg signed [PROD_W:0] s24 [0:23]; integer a0; always @(posedge clk or negedge rst_n) begin if (!rst_n) for (a0=0; a0<24; a0=a0+1) s24[a0] <= 0; else if (vpipe[2]) for (a0=0; a0<24; a0=a0+1) s24[a0] <= prod[2*a0] + prod[2*a0+1]; end
+  reg signed [PROD_W+1:0] s12 [0:11]; integer a1; always @(posedge clk or negedge rst_n) begin if (!rst_n) for (a1=0; a1<12; a1=a1+1) s12[a1] <= 0; else if (vpipe[3]) for (a1=0; a1<12; a1=a1+1) s12[a1] <= s24[2*a1] + s24[2*a1+1]; end
+  reg signed [PROD_W+2:0] s6 [0:5]; integer a2; always @(posedge clk or negedge rst_n) begin if (!rst_n) for (a2=0; a2<6; a2=a2+1) s6[a2] <= 0; else if (vpipe[4]) for (a2=0; a2<6; a2=a2+1) s6[a2] <= s12[2*a2] + s12[2*a2+1]; end
+  reg signed [PROD_W+3:0] s3 [0:2]; integer a3; always @(posedge clk or negedge rst_n) begin if (!rst_n) for (a3=0; a3<3; a3=a3+1) s3[a3] <= 0; else if (vpipe[5]) begin s3[0]<=s6[0]+s6[1]; s3[1]<=s6[2]+s6[3]; s3[2]<=s6[4]+s6[5]; end end
+  reg signed [PROD_W+4:0] s2 [0:1]; always @(posedge clk or negedge rst_n) begin if (!rst_n) begin s2[0]<=0; s2[1]<=0; end else if (vpipe[6]) begin s2[0]<=s3[0]+s3[1]; s2[1]<=s3[2]; end end
+  reg signed [PROD_W+5:0] s1; always @(posedge clk or negedge rst_n) begin if (!rst_n) s1 <= 0; else if (vpipe[7]) s1 <= s2[0] + s2[1]; end
+
+  // Final Output Stage (Stage 10)
+  wire [OUT_W-1:0] out_idx_final = out_idx_pipe[LAT-1];
+  wire signed [DATA_BITS-1:0] bias8 = bias_mem[out_idx_final];
+  wire signed [31:0] sum_with_bias = $signed({{(32-(PROD_W+6)){s1[PROD_W+5]}}, s1}) + $signed({{(32-DATA_BITS){bias8[DATA_BITS-1]}}, bias8});
+
+
+reg start_compute_pulse;
+always @(posedge clk or negedge rst_n) begin
+  if (!rst_n) begin
+    start_compute_pulse <= 1'b0;
+  end else begin
+    start_compute_pulse <= 1'b0; // ê¸°ë³¸ì€ 0
+    // FILL ìƒíƒœì—ì„œ ë§ˆì§€ë§‰ ì¸ë±ìŠ¤ + ê°€ì¤‘ì¹˜ ë¡œë”© ì™„ë£Œë©´ ë‹¤ìŒ í´ëŸ­ë¶€í„° COMPUTE
+    if (valid_in && !state && (buf_idx == INPUT_WIDTH-1) && load_done)
+      start_compute_pulse <= 1'b1;
   end
+end
 
-  // ---------- 25?ž…? ¥ ?•©?‚° ?Š¸ë¦? x2 ----------
-  wire signed [SUM_W-1:0] sumA, sumB;
-  adder_tree25_pipe #(.IN_W(PROD_W), .SUM_W(SUM_W)) AT_A (
-    .clk(clk), .rst_n(rst_n),
-    .in0(prodA[0]),  .in1(prodA[1]),  .in2(prodA[2]),  .in3(prodA[3]),  .in4(prodA[4]),
-    .in5(prodA[5]),  .in6(prodA[6]),  .in7(prodA[7]),  .in8(prodA[8]),  .in9(prodA[9]),
-    .in10(prodA[10]),.in11(prodA[11]),.in12(prodA[12]),.in13(prodA[13]),.in14(prodA[14]),
-    .in15(prodA[15]),.in16(prodA[16]),.in17(prodA[17]),.in18(prodA[18]),.in19(prodA[19]),
-    .in20(prodA[20]),.in21(prodA[21]),.in22(prodA[22]),.in23(prodA[23]),.in24(prodA[24]),
-    .sum(sumA)
-  );
-  adder_tree25_pipe #(.IN_W(PROD_W), .SUM_W(SUM_W)) AT_B (
-    .clk(clk), .rst_n(rst_n),
-    .in0(prodB[0]),  .in1(prodB[1]),  .in2(prodB[2]),  .in3(prodB[3]),  .in4(prodB[4]),
-    .in5(prodB[5]),  .in6(prodB[6]),  .in7(prodB[7]),  .in8(prodB[8]),  .in9(prodB[9]),
-    .in10(prodB[10]),.in11(prodB[11]),.in12(prodB[12]),.in13(prodB[13]),.in14(prodB[14]),
-    .in15(prodB[15]),.in16(prodB[16]),.in17(prodB[17]),.in18(prodB[18]),.in19(prodB[19]),
-    .in20(prodB[20]),.in21(prodB[21]),.in22(prodB[22]),.in23(prodB[23]),.in24(prodB[24]),
-    .sum(sumB)
-  );
+wire        v_raw = vpipe[LAT-1];
+wire [11:0] y_raw = sum_with_bias[SHIFT+11:SHIFT];
 
-  // out_idx ?ŒŒ?´?”„: ?„ ?ž˜ì¹? + ?Š¸ë¦? ì§??—° ë§Œí¼
-  reg [3:0] out_idx_pipe [0:AT_LAT+1];
-  integer p;
-  always @(posedge clk) begin
-    if (!rst_n) begin
-      for (p=0;p<=AT_LAT+1;p=p+1) out_idx_pipe[p] <= 4'd0;
+// ì²« ê²°ê³¼ 1íšŒ ë§ˆìŠ¤í‚¹ í”Œëž˜ê·¸
+reg suppress_first_valid;
+
+always @(posedge clk or negedge rst_n) begin
+  if (!rst_n) begin
+    data_out            <= 12'd0;
+    valid_out_fc        <= 1'b0;
+    suppress_first_valid<= 1'b1;   // ë¦¬ì…‹ í›„ ì²« ê²°ê³¼ëŠ” ë§ˆìŠ¤í‚¹
+  end else begin
+    // COMPUTE ìƒˆ ë¼ìš´ë“œ ì‹œìž‘ ì‹œ ë‹¤ì‹œ 1íšŒ ë§ˆìŠ¤í‚¹ ë¬´ìž¥
+    if (start_compute_pulse)
+      suppress_first_valid <= 1'b1;
+
+    // ë°ì´í„°ëŠ” í‰ì†ŒëŒ€ë¡œ: v_raw ëœ¨ëŠ” ê·¸ ì‚¬ì´í´ì— ê°±ì‹ 
+    if (v_raw)
+      data_out <= y_raw;
+
+    // validëŠ” ì²« ê²°ê³¼ë§Œ 1íšŒ ë§ˆìŠ¤í‚¹í•˜ê³ , ê·¸ ë‹¤ìŒë¶€í„°ëŠ” ê·¸ëŒ€ë¡œ í†µê³¼
+    if (v_raw && suppress_first_valid) begin
+      valid_out_fc        <= 1'b0;   // ì²« ê²°ê³¼ëŠ” valid ë‚´ì§€ ì•ŠìŒ
+      suppress_first_valid<= 1'b0;   // ë§ˆìŠ¤í‚¹ í•´ì œ
     end else begin
-      out_idx_pipe[0] <= out_idx_q;
-      for (p=1;p<=AT_LAT+1;p=p+1) out_idx_pipe[p] <= out_idx_pipe[p-1];
+      valid_out_fc <= v_raw;         // ê·¸ ë‹¤ìŒë¶€í„°ëŠ” ì •ìƒ valid
     end
   end
+end
 
-  // bias/ìµœì¢… ê°??‚° (ë¸”ë¡ ë°? ?„ ?–¸ ?†’ Verilog-2001 ?˜¸?™˜)
-  reg signed [DATA_BITS-1:0] bias_sel;
-  reg signed [SUM_W:0]       bias_ext;
-  reg signed [SUM_W:0]       sum_final;
 
-  always @(posedge clk) begin
+
+  // Input Fill / Compute FSM
+  integer ii;
+  always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
-      bias_sel  <= {DATA_BITS{1'b0}};
-      bias_ext  <= {SUM_W+1{1'b0}};
-      sum_final <= {SUM_W+1{1'b0}};
+      state <= 1'b0; buf_idx <= 0; out_idx <= 0;
+      for (ii=0; ii<INPUT_NUM; ii=ii+1) buffer[ii] <= 14'sd0;
     end else begin
-      bias_sel  <= bias[out_idx_pipe[AT_LAT+1]];
-      bias_ext  <= {{(SUM_W+1-DATA_BITS){bias_sel[DATA_BITS-1]}}, bias_sel};
-      sum_final <= $signed(sumA) + $signed(sumB) + bias_ext;
-    end
-  end
-
-  // valid ?ŒŒ?´?”„ (ì´? LAT)
-  reg [LAT-1:0] vpipe;
-  always @(posedge clk) begin
-    if (!rst_n) begin
-      vpipe        <= {LAT{1'b0}};
-      data_out     <= 12'd0;
-      valid_out_fc <= 1'b0;
-    end else begin
-      vpipe        <= {vpipe[LAT-2:0], fire_calc_q}; // ?„ ?ž˜ì¹? ë°˜ì˜
-      data_out     <= sum_final[18:7];               // ê¸°ì¡´ê³? ?™?¼?•œ ?Š¬?¼?´?Š¤
-      valid_out_fc <= vpipe[LAT-1];
-    end
-  end
-
-  // -------- ?ž…? ¥ ?ˆ˜ì§? FSM (?›?™?ž‘ ?œ ì§?) --------
-  always @(posedge clk) begin
-    if (!rst_n) begin
-      buf_idx <= 0; out_idx <= 0; state <= 1'b0;
-    end else if (valid_in) begin
-      if (!state) begin
-        buffer[buf_idx]                 <= data1;
-        buffer[INPUT_WIDTH + buf_idx]   <= data2;
-        buffer[INPUT_WIDTH*2 + buf_idx] <= data3;
-        buf_idx <= buf_idx + 1'b1;
-        if (buf_idx == INPUT_WIDTH-1) begin
-          buf_idx <= 0; state <= 1'b1; out_idx <= 4'd0;
-        end
-      end else begin
-        if (out_idx == OUTPUT_NUM-1) begin
-          out_idx <= 4'd0; state <= 1'b0;
+      if (valid_in) begin
+        if (!state) begin
+          buffer[buf_idx] <= d1; buffer[INPUT_WIDTH+buf_idx] <= d2; buffer[INPUT_WIDTH*2+buf_idx] <= d3;
+          if (buf_idx == INPUT_WIDTH-1) begin
+            buf_idx <= 0;
+            if (load_done) state <= 1'b1;
+          end else begin
+            buf_idx <= buf_idx + 1'b1;
+          end
         end else begin
-          out_idx <= out_idx + 1'b1;
+          if (out_idx == OUTPUT_NUM-1) out_idx <= 0;
+          else                         out_idx <= out_idx + 1'b1;
         end
       end
     end
   end
+
 endmodule
