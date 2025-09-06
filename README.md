@@ -13,6 +13,7 @@
 <img width="589" height="336" alt="image" src="https://github.com/user-attachments/assets/333ea524-6813-4a5c-8749-2b64c2b8a9bb" />
 
 [그림 1] Adder Tree Pipelining Simulation
+
 Ref 코드는 한 출력당 N 사이클이 필요하지만, 개선한 conv 코드는 모든 곱을 동시에 만들고, Adder 
 tree pipe로 넘겨 합산하게 하여 곱셈기에서 바로 다음 곱을 실행할 수 있어서, 파이프라인이 충전
 되면 매 사이클 1출력까지 가능하게 하였다. load_done 변수를 통해 BRAM에 10워드가 실제 커밋 완
